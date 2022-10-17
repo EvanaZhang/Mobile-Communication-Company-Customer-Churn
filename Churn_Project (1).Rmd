@@ -1,0 +1,503 @@
+---
+title: "Churn_Project"
+author: "Yifei Zhang"
+date: "10/25/2021"
+output: html_document
+---
+
+# Libraries
+```{r,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(glmnet)
+library(rpart.plot)
+library(vip)
+library(reshape2)
+library(dplyr)
+library(corrplot)
+
+```
+
+# Load In Dataset
+```{r}
+Churn <- read_csv("churn_training.csv") %>% 
+  janitor::clean_names()
+Churn %>% head()
+```
+
+# Data Profile
+```{r}
+Churn %>% skim()
+```
+
+
+# Select Data
+```{r}
+Churn_s <- Churn %>% 
+  select(customer_id, phone_model, monthly_minutes, customer_service_calls, 
+         streaming_minutes, total_billed, prev_balance, late_payments, partner, 
+         phone_service, multiple_lines, streaming_plan, mobile_hotspot, 
+         wifi_calling_text, online_backup, device_protection, number_phones, 
+         paperless_billing, payment_method,network_speed, senior_citizen, churn)
+```
+
+# Target Variable
+```{r}
+Churn_s %>% 
+  count(churn) %>% 
+  mutate(pct = round(n / sum(n), 4)) -> churn_pct
+
+churn_pct %>% 
+  ggplot(aes(x = churn, y = pct)) + 
+  geom_col() +
+  geom_text(aes(label = pct), color = "red") + 
+  labs(title = "Churn Identification")
+  
+```
+
+# Explore Relationship 
+```{r}
+Churn_s %>% 
+  mutate(senior_citizen=as.character(senior_citizen)) %>% 
+  mutate(churn = as.factor(churn)) -> Churn_s
+
+numeric_vars <- function(x){
+ggplot(Churn_s, aes(y=churn, x=!!as.name(x))) + 
+    geom_boxplot() + 
+    labs(title=paste("Relationship Between Churn and ", x, sep=""))
+}
+
+
+for (col in names(Churn_s %>% select_if(is_numeric))){
+  if (col != 'churn'){
+    chrt <- numeric_vars(col)
+    print(chrt)
+  }
+}
+
+```
+# Explore Correlation
+```{r}
+Churn_s %>% 
+  select_if(is_numeric) %>% 
+  mutate(churn = as.numeric(churn))-> churn_cor
+cormat <- cor(churn_cor)
+corrplot(cormat)
+```
+# Make Factors
+```{r}
+Churn_s <- Churn_s %>% 
+  mutate(churn = as_factor(churn)) %>% 
+  mutate_if(is.character, as_factor)
+```
+
+## Train & Test Split
+```{r}
+set.seed(123)
+
+train_test_split <- initial_split(Churn_s, prop = 0.7, strata = churn)
+
+train <- training(train_test_split)
+test <- testing(train_test_split)
+
+sprintf("Train Percent: %1.2f%%", nrow(train) / nrow(Churn_s) * 100)
+sprintf("Test Percent: %1.2f%%", nrow(test) / nrow(Churn_s) * 100)
+```
+## Standard Logistic Model
+## Recipe
+```{r,warning=FALSE,message=FALSE}
+Churn_recipe <- recipe(churn ~., data = train) %>% 
+  step_rm(customer_id) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_impute_mean(all_numeric_predictors()) %>% 
+  step_impute_mode(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+
+logistic_spec <- logistic_reg() %>% 
+  set_mode("classification") %>% 
+  set_engine("glm")
+
+logistic_wf <- workflow() %>% 
+  add_recipe(Churn_recipe) %>% 
+  add_model(logistic_spec) %>% 
+  fit(train)
+
+logistic_wf %>% 
+  pull_workflow_fit() %>% 
+  tidy() %>% 
+  mutate(across(is.numeric, round, 3)) 
+
+logistic_wf %>% 
+  pull_workflow_fit() %>% 
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf, train, type = "prob") %>% 
+  bind_cols(predict(logistic_wf, train, type = "class")) %>% 
+  bind_cols(train) %>% 
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(logistic_wf, test, type = "prob") %>% 
+  bind_cols(predict(logistic_wf, test, type = "class")) %>% 
+  bind_cols(test) -> logistic_test
+
+logistic_test %>% 
+  metrics(churn, estimate = .pred_class, .pred_1)
+```
+
+# Lasso L1 Regression
+```{r}
+lasso_spec <- logistic_reg(penalty = 0.01, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+logistic_wf_lasso <- workflow() %>%
+  add_recipe(Churn_recipe) %>%
+  add_model(lasso_spec) %>%
+  fit(train)
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf_lasso, train, type="prob") %>%
+  bind_cols(predict(logistic_wf_lasso, train, type="class")) %>%
+  bind_cols(train)  %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+
+logistic_wf_lasso %>%
+  pull_workflow_fit() %>%
+  vip()
+
+logistic_wf_lasso %>%
+ pull_workflow_fit() %>%
+  tidy()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf_lasso, train, type="prob") %>%
+  bind_cols(predict(logistic_wf_lasso, train, type="class")) %>%
+  bind_cols(train)  %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+
+predict(logistic_wf_lasso, test, type="prob") %>%
+  bind_cols(predict(logistic_wf_lasso, test, type="class")) %>%
+  bind_cols(test) -> lasso_test 
+
+lasso_test %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+```
+# Ridge Regression L2
+```{r,warning=FALSE,message=FALSE}
+ridge_spec <- logistic_reg(penalty = 0.01, mixture = 0) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+logistic_wf_ridge <- workflow() %>%
+  add_recipe(Churn_recipe) %>%
+  add_model(ridge_spec) %>%
+  fit(train)
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf_ridge, train, type="prob") %>%
+  bind_cols(predict(logistic_wf_ridge, train, type="class")) %>%
+  bind_cols(train)  %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+logistic_wf_ridge %>%
+ pull_workflow_fit() %>%
+  tidy()
+
+logistic_wf_ridge %>%
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf_ridge, train, type="prob") %>%
+  bind_cols(predict(logistic_wf_ridge, train, type="class")) %>%
+  bind_cols(train) %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+
+predict(logistic_wf_ridge, test, type="prob") %>%
+  bind_cols(predict(logistic_wf_ridge, test, type="class")) %>%
+  bind_cols(test) -> ridge_test
+
+ ridge_test %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+```
+# Compare Model
+```{r}
+# Logistic 
+logistic_test %>% 
+  mutate(name = "logistic") %>% 
+  bind_rows(lasso_test %>% mutate(name = "lasso")) %>% 
+  bind_rows(ridge_test %>% mutate(name = "ridge")) %>% 
+  group_by(name) %>% 
+  metrics(churn, estimate = .pred_class, .pred_1) %>% 
+  pivot_wider(id_cols = name, names_from = .metric, values_from = .estimate)
+
+```
+
+```{r}
+# Evaluate Selected Logistic Regression
+logistic_test %>% 
+  conf_mat(churn, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + labs(title = "Confusion Matrix Defalut")
+
+logistic_test %>% 
+  accuracy(churn, estimate = .pred_class)
+
+logistic_test %>% 
+  precision(churn, estimate = .pred_class)
+
+logistic_test %>% 
+  recall(churn, estimate = .pred_class)
+
+logistic_test %>% 
+  ggplot(aes(.pred_1, fill = churn)) + 
+  geom_histogram(bins = 100) + 
+  xlim(0, 1) + 
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept = 0.1)) + 
+  labs(title = "Change Threshold to 0.1")
+
+logistic_test %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >= 0.1, 1, 0))) %>%
+  conf_mat(churn, estimate = predict_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "confusion matrix threshold >= 0.1")
+
+logistic_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >= 0.1, 1, 0))) %>%
+  accuracy(churn, predict_class)  
+
+logistic_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >= 0.1, 1, 0))) %>%
+  precision(churn, estimate = predict_class)   
+
+logistic_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >= 0.1,1,0))) %>%
+  recall(churn, estimate = predict_class)  
+
+```
+
+```{r}
+logistic_test %>%
+  pr_curve(churn, .pred_1) %>%
+  mutate(recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3)) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision), .threshold = min(.threshold))
+```
+
+# Decision Tree
+```{r}
+Churn_recipe_tree <- recipe(churn ~ ., data = train) %>%
+  step_rm(customer_id) %>% 
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+tree_spec <- decision_tree(cost_complexity = 0.001) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+tree_wf <- workflow() %>%
+  add_recipe(Churn_recipe_tree) %>%
+  add_model(tree_spec) %>%
+  fit(train)
+
+tree_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+# Plot the tree
+rpart.plot(tree_wf$fit$fit$fit)
+rpart.rules(tree_wf$fit$fit$fit)
+
+# -- deal w. the first event issue -- # 
+options(yardstick.event_first = FALSE)
+predict(tree_wf, train, type="prob") %>%
+  bind_cols(predict(tree_wf, train, type="class")) %>%
+  bind_cols(train)  %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(tree_wf, test, type="prob") %>%
+  bind_cols(predict(tree_wf, test, type="class")) %>%
+  bind_cols(test) -> tree_test 
+
+tree_test %>% 
+  conf_mat(churn, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + labs(title = "Confusion Matrix Tree 1 Defalut")
+
+tree_test %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+tree_test %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  conf_mat(churn, estimate = predict_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="confusion matrix - tree 1 default")
+
+tree_test %>% 
+  ggplot(aes(.pred_1, fill = churn)) + 
+  geom_histogram(bins = 100) + 
+  xlim(0, 1) + 
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept = 0.1)) + 
+  labs(title = "Change Threshold to 0.1")
+
+tree_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  accuracy(churn, predict_class)  
+
+tree_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  precision(churn, estimate = predict_class)   
+
+tree_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  recall(churn, estimate = predict_class) 
+```
+
+# Loss Matrix
+```{r}
+TP = 0
+FP = 1
+TN = 0
+FN = 3
+       
+loss_matr <- matrix(c(TP, FP, FN, TN), nrow = 2, byrow = TRUE)
+loss_matr
+```
+```{r}
+Churn_recipe_tree <- recipe(churn ~ ., 
+                      data = train) %>%
+  step_rm(customer_id) %>% 
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+tree_spec <- decision_tree(cost_complexity = 0.001) %>%
+  set_mode("classification") %>%
+  set_engine("rpart", 
+             parms = list(loss = loss_matr),
+             model=TRUE)
+
+tree_wf2 <- workflow() %>%
+  add_recipe(Churn_recipe_tree) %>%
+  add_model(tree_spec) %>%
+  fit(train)
+
+tree_wf2 %>%
+  pull_workflow_fit() %>%
+  vip()
+
+# Plot the tree
+rpart.plot(tree_wf2$fit$fit$fit)
+rpart.rules(tree_wf2$fit$fit$fit)
+```
+```{r}
+# -- deal w. the first event issue -- # 
+options(yardstick.event_first = FALSE)
+predict(tree_wf2, train, type="prob") %>%
+  bind_cols(predict(tree_wf2, train, type="class")) %>%
+  bind_cols(train)  %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(tree_wf2, test, type="prob") %>%
+  bind_cols(predict(tree_wf2, test, type="class")) %>%
+  bind_cols(test) -> tree_test2
+
+tree_test2 %>% 
+  conf_mat(churn, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + labs(title = "Confusion Matrix Tree 2 Defalut")
+
+tree_test2 %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+tree_test2 %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  conf_mat(churn, estimate = predict_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="confusion matrix - tree 2 default")
+
+tree_test2 %>% 
+  ggplot(aes(.pred_1, fill = churn)) + 
+  geom_histogram(bins = 100) + 
+  xlim(0, 1) + 
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept = 0.1)) + 
+  labs(title = "Change Threshold to 0.1")
+
+tree_test2 %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  accuracy(churn, predict_class)  
+
+tree_test2 %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  precision(churn, estimate = predict_class)   
+
+tree_test2 %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.1,1,0))) %>%
+  recall(churn, estimate = predict_class) 
+```
+
+# Predict 
+```{r}
+newchurn <- read_csv("Churn_holdout.csv") %>%
+  clean_names() 
+
+newchurn %>% skim()
+
+newchurn%>%
+  select(customer_id, phone_model, monthly_minutes, customer_service_calls, 
+         streaming_minutes, total_billed, prev_balance, late_payments, partner, 
+         phone_service, multiple_lines, streaming_plan, mobile_hotspot, 
+         wifi_calling_text, online_backup, device_protection, number_phones, 
+         paperless_billing, payment_method,network_speed, senior_citizen)->clean_newchurn
+
+clean_newchurn$senior_citizen=as.character(clean_newchurn$senior_citizen)
+head(clean_newchurn)
+
+predict(logistic_wf, clean_newchurn, type = "prob") %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.15,1,0))) -> pred_churn
+
+newchurn %>%
+  select(customer_id) %>%
+  cbind(pred_churn$predict_class)->final_pred
+
+final_pred <- setNames(final_pred, c("customer_id","churn"))
+    
+head(final_pred)
+
+library(writexl)
+write_csv(final_pred, 'Scored_NewChurn.csv')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
